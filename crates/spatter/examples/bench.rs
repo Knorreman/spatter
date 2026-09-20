@@ -64,16 +64,9 @@ fn skewed_agg(sc: &SpatterContext, path: &str) -> Result<()> {
         .read_text_file(path)?
         .flat_map(|line| {
             line.split_whitespace()
-                .map(|w| {
-                    if w.len() % 100 == 0 {
-                        "hot".to_string()
-                    } else {
-                        w.to_string()
-                    }
-                })
+                .flat_map(|w| [("hot".to_string(), 9usize), (format!("key:{w}"), 1usize)])
                 .collect::<Vec<_>>()
         })
-        .map(|w| (w, 1usize))
         .reduce_by_key(|a, b| a + b)
         .collect_to_driver()?;
     let ms = t0.elapsed().as_millis();
@@ -82,9 +75,13 @@ fn skewed_agg(sc: &SpatterContext, path: &str) -> Result<()> {
         .find(|(k, _)| k == "hot")
         .map(|(_, v)| *v)
         .unwrap_or(0);
+    let sum: usize = counts.iter().map(|(_, v)| v).sum();
     report(
         sc,
-        format!("BENCH skew exec_ms={ms} keys={} hot={hot}", counts.len()),
+        format!(
+            "BENCH skew exec_ms={ms} keys={} hot={hot} sum={sum}",
+            counts.len()
+        ),
     );
     Ok(())
 }
@@ -115,7 +112,7 @@ fn main() -> Result<()> {
     let scenario = env::var("BENCH_SCENARIO").unwrap_or_else(|_| "wordcount".into());
     let t0 = Instant::now();
     let sc = SpatterContext::builder()
-        .master("local[*]")
+        .master(env::var("BENCH_MASTER").unwrap_or_else(|_| "local[16]".into()))
         .get_or_create()?;
     let startup_ms = t0.elapsed().as_millis();
     report(
@@ -131,11 +128,15 @@ fn main() -> Result<()> {
         }
     }
     let (sent, recv) = sc.net_bytes();
+    let peaks = sc.gather_u64(peak_rss_kb())?;
+    let sent = sc.gather_u64(sent)?;
+    let recv = sc.gather_u64(recv)?;
     report(
         &sc,
         format!(
-            "BENCH end sent={sent} recv={recv} peak_kb={} scenario={scenario}",
-            peak_rss_kb()
+            "BENCH end sent={} recv={} peak_kb={} rank_peaks_kb={peaks:?} sum_rank_peaks_kb={} scenario={scenario}",
+            sent.iter().sum::<u64>(), recv.iter().sum::<u64>(),
+            peaks.iter().copied().max().unwrap_or(0), peaks.iter().sum::<u64>()
         ),
     );
     Ok(())

@@ -429,13 +429,17 @@ where
                             }
                         }
                         let guard = SpillGuard(paths);
-                        let mut reduced = Vec::with_capacity(n_out);
-                        for path in &guard.0 {
-                            reduced.push(crate::shuffle::reduce_spilled_path(
-                                path,
+                        let reduce_threads = std::env::var("SPATTER_REDUCE_THREADS")
+                            .ok()
+                            .and_then(|s| s.parse::<usize>().ok())
+                            .unwrap_or(2)
+                            .clamp(1, parallelism.max(1));
+                        let reduced = run_partitions(n_out, reduce_threads, ctx, |p, _| {
+                            crate::shuffle::reduce_spilled_path(
+                                &guard.0[p],
                                 merge_combiners.as_ref(),
-                            )?);
-                        }
+                            )
+                        })?;
                         store_blocks(shuffle.0, reduced)
                     }
                 }
