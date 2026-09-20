@@ -50,6 +50,8 @@ jobs:
           printf 'hello world hello\nfoo bar foo\n' > input.txt
           cargo run --release --locked --example wordcount -- --cluster 3 input.txt 2>&1 | tee /tmp/wc.log
           grep -q "keys=4 sum=6" /tmp/wc.log
+      - name: Worker death and repeated cluster runs
+        run: python3 tests/cluster_process.py
       - name: Bench suite smoke test
         run: |
           printf 'hello world hello\nfoo bar foo\n' > input.txt
