@@ -108,6 +108,7 @@ fn wait_or_kill(child: &mut Child, timeout: Duration) {
 }
 
 fn write_frame(stream: &mut TcpStream, bytes: &[u8], sent: &AtomicU64) -> Result<()> {
+    let _span = crate::profile::Span::new("network_write");
     if bytes.len() > MAX_FRAME {
         return Err(Error::Cluster("frame too large to send".into()));
     }
@@ -121,6 +122,7 @@ fn write_frame(stream: &mut TcpStream, bytes: &[u8], sent: &AtomicU64) -> Result
 }
 
 fn read_frame(stream: &mut TcpStream, recv: &AtomicU64) -> Result<Vec<u8>> {
+    let _span = crate::profile::Span::new("network_read_wait");
     let mut lenb = [0u8; 4];
     stream.read_exact(&mut lenb).map_err(io_err)?;
     let len = u32::from_be_bytes(lenb) as usize;
@@ -134,10 +136,12 @@ fn read_frame(stream: &mut TcpStream, recv: &AtomicU64) -> Result<Vec<u8>> {
 }
 
 fn encode<T: Serialize>(v: &T) -> Result<Vec<u8>> {
+    let _span = crate::profile::Span::new("encode");
     bincode::serialize(v).map_err(io_err)
 }
 
 fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+    let _span = crate::profile::Span::new("decode");
     bincode::deserialize(bytes).map_err(io_err)
 }
 

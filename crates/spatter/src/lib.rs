@@ -5,6 +5,7 @@ mod dag;
 mod exec;
 mod lineage;
 mod partitioner;
+mod profile;
 mod rdd;
 mod shuffle;
 mod source;

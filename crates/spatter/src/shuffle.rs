@@ -67,6 +67,7 @@ where
     MergeV: Fn(C, V) -> C,
 {
     use std::sync::atomic::Ordering;
+    let _span = crate::profile::Span::new("map_combine");
     let mut combined: HashMap<K, C> = HashMap::new();
     let mut buckets = Vec::with_capacity(n_out);
     for _ in 0..n_out {
@@ -105,6 +106,7 @@ where
     K: Eq + Hash,
     F: Fn(V, V) -> V,
 {
+    let _span = crate::profile::Span::new("reduce_memory");
     let mut map = HashMap::new();
     for (k, v) in pairs {
         combine(&mut map, k, v, f);
@@ -228,7 +230,7 @@ impl<T: Serialize> IncrementalBuckets<T> {
         let mut files = Vec::with_capacity(self.n_out);
         for i in 0..self.n_out {
             let path = std::env::temp_dir().join(format!(
-                "spatter-spill-{}-{}-{}-{}.bin",
+                "spatter-map-spill-{}-{}-{}-{}.bin",
                 pid, self.id, self.seq, i
             ));
             let wrote = (|| {
@@ -288,6 +290,7 @@ impl<T: Serialize> Drop for IncrementalBuckets<T> {
 }
 
 fn append_chunk<T: Serialize>(file: &mut File, chunk: &[T]) -> Result<()> {
+    let _span = crate::profile::Span::new("spill_encode_write");
     if chunk.is_empty() {
         return Ok(());
     }
@@ -312,6 +315,7 @@ where
     V: DeserializeOwned,
     F: Fn(V, V) -> V,
 {
+    let _span = crate::profile::Span::new("spill_read_reduce");
     let mut file = File::open(path).map_err(|e| Error::Io(e.to_string()))?;
     let mut map = HashMap::new();
     loop {

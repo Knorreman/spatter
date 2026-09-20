@@ -1,5 +1,46 @@
 # Benchmark results
 
+## Corrected measurements after dispatch hardening
+
+The older results below used driver-only RSS and a skew transformation that
+did not produce a hot key on this corpus. Their cluster-wide memory and skew
+claims are withdrawn. The runner also previously failed to pass the spill
+setting to the engine. See `bench/README.md` for corrected semantics.
+
+Controlled wordcount runs: 446,667,000-byte corpus, 200,000 keys, 60,000,000
+words; Linux 6.8, release build, CPU affinity 0–15 shared by all ranks,
+16 partitions, 64 MiB spill threshold, three fresh processes per mode.
+No cache dropping; sequential runs, not randomized trials.
+
+| Mode | Serial spilled reduce, ms | Default two-thread reduce, ms | Median improvement |
+|---|---|---|---|
+| local | 5343, 5359, 5347 | 4756, 4748, 4815 | 11.1% |
+| 4 ranks | 8579, 8717, 8559 | 8025, 8208, 8227 | 4.3% |
+| 16 ranks | 5832, 5940, 5897 | 5397, 5492, 5497 | 6.9% |
+
+All runs matched the expected key count and total. Four-rank maximum per-rank
+RSS rose from 304,552–314,352 KiB to 319,488–323,944 KiB; sums of rank peaks
+were 822,824–855,332 versus 829,180–861,500 KiB. Sixteen-rank sums remained
+about 1.64 million KiB—more than local execution's roughly 1 million KiB.
+Sum of rank peaks is not simultaneous aggregate RSS.
+
+An exploratory 16-reducer configuration gave medians of 4147/7498/4732 ms
+(local/4/16 ranks), but four-rank driver peak RSS reached 539,372–545,444 KiB.
+The default is therefore two reducer threads, capped by context parallelism;
+`SPATTER_REDUCE_THREADS` allows explicit tuning.
+
+An opt-in profile before optimization showed 1.45 s in serial spilled
+reduction, 0.33 s in spill encode/write and about 0.63 s each in transport
+encode/decode summed across ranks. Map/combine spans totaled 16.06 s across
+concurrent ranks; these sums are not critical-path wall time. Network reads
+include waiting for computation. This supports optimizing spilled reduction,
+not attributing the whole regression to network bandwidth.
+
+Forced-spill tests additionally exposed and fixed a map/output spill filename
+collision. The full shuffle and DAG suites now pass with a zero spill threshold.
+
+## Historical measurements (limitations above apply)
+
 Suite: `bench/run.sh` (see header for usage). Hardware: developer workstation
 (Linux 6.8, rustc 1.98.1, release profile). Input: `/tmp/gospark-wc-big.txt`
 (426 MiB, 1.5M lines, 60M words, 200k distinct). `BENCH_RANKS=4`,

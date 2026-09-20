@@ -19,7 +19,7 @@ cd "$(dirname "$0")/.."
 export PATH="$HOME/.cargo/bin:$PATH"
 
 BENCH_INPUT="${1:-${BENCH_INPUT:-/tmp/gospark-wc-big.txt}}"
-BENCH_REPS="${BENCH_REPS:-3}"
+BENCH_REPS="${2:-${BENCH_REPS:-3}}"
 BENCH_MODES="${BENCH_MODES:-local cluster}"
 BENCH_RANKS="${BENCH_RANKS:-4}"
 BENCH_SPILL_MB="${BENCH_SPILL_MB:-64}"
@@ -29,10 +29,19 @@ if [[ ! -r "$BENCH_INPUT" ]]; then
     exit 1
 fi
 
-EXPECTED_KEYS="$(tr ' ' '\n' < "$BENCH_INPUT" | sed '/^$/d' | sort -u | wc -l)"
-EXPECTED_SUM="$(tr ' ' '\n' < "$BENCH_INPUT" | sed '/^$/d' | wc -l)"
+read -r EXPECTED_KEYS EXPECTED_SUM < <(python3 - "$BENCH_INPUT" <<'PY'
+import sys
+keys, total = set(), 0
+with open(sys.argv[1]) as source:
+    for line in source:
+        words = line.split()
+        keys.update(words)
+        total += len(words)
+print(len(keys), total)
+PY
+)
 
-cargo build --release --example bench
+cargo build --release --locked --example bench
 
 run_case() {
     local scenario="$1" mode="$2" rep="$3"
@@ -43,8 +52,12 @@ run_case() {
         mode_name="cluster$BENCH_RANKS"
     fi
     local out
-    out="$(BENCH_SCENARIO="$scenario" BENCH_SPILL_MB="$BENCH_SPILL_MB" \
-        ./target/release/examples/bench "${extra[@]}" "$BENCH_INPUT" 2>&1 || true)"
+    if ! out="$(BENCH_SCENARIO="$scenario" SPATTER_SPILL_MB="$BENCH_SPILL_MB" \
+        timeout "${BENCH_TIMEOUT:-300}" ./target/release/examples/bench "${extra[@]}" "$BENCH_INPUT" 2>&1)"; then
+        echo "$out" >&2
+        exit 1
+    fi
+    echo "$out" >&2
     local startup exec_ms peak
     startup="$(grep -o 'startup_ms=[0-9]*' <<<"$out" | cut -d= -f2 | tail -1)"
     exec_ms="$(grep -o 'exec_ms=[0-9]*' <<<"$out" | cut -d= -f2 | head -1)"
@@ -63,11 +76,11 @@ run_case() {
             || { echo "FAILED scenario=$scenario mode=$mode_name rep=$rep (reuse mismatch)" >&2
                  grep 'BENCH' <<<"$out" >&2; exit 1; }
     elif [[ "$scenario" == skew ]]; then
-        grep -q "keys=$EXPECTED_KEYS hot=[0-9]*" <<<"$out" \
+        grep -q "keys=$((EXPECTED_KEYS + (EXPECTED_SUM > 0))) hot=$((EXPECTED_SUM * 9)) sum=$((EXPECTED_SUM * 10))$" <<<"$out" \
             || { echo "FAILED scenario=$scenario mode=$mode_name rep=$rep (skew mismatch)" >&2
                  grep 'BENCH' <<<"$out" >&2; exit 1; }
     fi
-    echo "bench,${scenario},${mode_name},${rep},${startup},${exec_ms},${peak}"
+    echo "${scenario},${mode_name},${rep},${startup},${exec_ms},${peak}"
 }
 
 echo "scenario,mode,rep,startup_ms,exec_ms,peak_kb"
