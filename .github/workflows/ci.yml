@@ -50,6 +50,10 @@ jobs:
           printf 'hello world hello\nfoo bar foo\n' > input.txt
           cargo run --release --locked --example wordcount -- --cluster 3 input.txt 2>&1 | tee /tmp/wc.log
           grep -q "keys=4 sum=6" /tmp/wc.log
+      - name: Bench suite smoke test
+        run: |
+          printf 'hello world hello\nfoo bar foo\n' > input.txt
+          BENCH_INPUT=input.txt BENCH_REPS=1 bench/run.sh
 
   k8s:
     runs-on: ubuntu-latest

@@ -18,3 +18,7 @@ path = "examples/sum.rs"
 [[example]]
 name = "wordcount"
 path = "examples/wordcount.rs"
+
+[[example]]
+name = "bench"
+path = "examples/bench.rs"
