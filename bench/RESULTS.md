@@ -20,16 +20,17 @@ identical counts across 3 actions; skew reports a nonzero `hot` bucket.
 
 ## Findings
 
-1. **Peak memory**: cluster mode cuts driver peak RSS ~4x (1.0 GiB -> 0.26 GiB)
+1. **Peak memory**: cluster mode cuts driver peak RSS ~2-4x (1.0 GiB -> 0.26-0.5 GiB)
    by streaming map output over TCP instead of materializing locally.
 2. **Reuse amplification**: 3 `count()` actions over one shuffled RDD cost ~3x
    a single action in both modes (shuffle blocks are cached per action only).
-3. **REGRESSION vs pre-dispatch cluster**: before driver-dispatch, `--cluster 16`
-   wordcount ran in 2.3-2.5 s; the current star-topology `dispatch_each` sends
-   tasks one at a time, blocking on each reply (serial per partition), and
-   clusters all shuffle bytes through the driver. Result: cluster4 is ~20 s,
-   ~3.5x slower than local. Follow-up work: pipeline task dispatch (in-flight
-   window > 1) and per-rank shuffle write to unblock cluster scaling.
+3. **Pipelined dispatch (fixed)**: `dispatch_each` previously sent one task and
+   blocked on its full compute+reply round trip, serializing all remote work:
+   cluster4 wordcount ~20 s, ~3.5x slower than local. After pipelining task
+   writes, reading replies concurrently per worker stream, and running worker
+   computes on a thread pool: cluster4 20 s -> 7.5 s, cluster16 wordcount 5.7 s
+   (matches local; was 2.3-2.5 s before driver-dispatch). Remaining gap vs the
+   pre-dispatch cluster is shuffle bytes round-tripping through the driver.
 4. Startup cost of forking ranks and joining TCP is negligible (< 100 ms).
 
 ## Spark baseline
