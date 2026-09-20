@@ -1,0 +1,50 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: spatter
+spec:
+  clusterIP: None
+  ports:
+    - name: cluster
+      port: 18741
+  selector:
+    app: spatter
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: spatter
+spec:
+  serviceName: spatter
+  replicas: 3
+  selector:
+    matchLabels:
+      app: spatter
+  template:
+    metadata:
+      labels:
+        app: spatter
+    spec:
+      containers:
+        - name: spatter
+          image: localhost/spatter:latest
+          imagePullPolicy: IfNotPresent
+          args: ["/data/input.txt"]
+          env:
+            - name: SPATTER_N
+              value: "3"
+            - name: SPATTER_PORT
+              value: "18741"
+            - name: SPATTER_BIND
+              value: "0.0.0.0"
+            - name: SPATTER_MASTER
+              value: "spatter-0.spatter:18741"
+          ports:
+            - containerPort: 18741
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          configMap:
+            name: wc-input

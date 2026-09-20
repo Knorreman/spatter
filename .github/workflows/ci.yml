@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: [stable, "1.74"]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --all-targets --locked
+      - run: cargo test --doc --workspace --locked
+      - name: Cluster smoke test
+        run: |
+          printf 'hello world hello\nfoo bar foo\n' > input.txt
+          cargo run --release --locked --example wordcount -- --cluster 3 input.txt 2>&1 | tee /tmp/wc.log
+          grep -q "keys=4 sum=6" /tmp/wc.log
+
+  k8s:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: spatter
+      - run: docker build -f deploy/Dockerfile -t localhost/spatter:latest .
+      - run: kind load docker-image localhost/spatter:latest --name spatter
+      - name: Deploy wordcount
+        run: |
+          printf 'hello world hello\nfoo bar foo\n' > input.txt
+          kubectl create configmap wc-input --from-file=input.txt
+          kubectl apply -f deploy/k8s/wordcount.yaml
+          kubectl rollout status statefulset/spatter --timeout=120s
+      - name: Assert driver output
+        run: |
+          timeout 180 bash -c 'until logs=$(kubectl logs spatter-0 2>/dev/null) && grep -q "keys=4 sum=6" <<< "$logs"; do sleep 3; done'
+          kubectl logs spatter-0 | grep METRICS
+      - name: Teardown
+        if: always()
+        run: kind delete cluster --name spatter
