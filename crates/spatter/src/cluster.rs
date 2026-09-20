@@ -325,10 +325,28 @@ impl Cluster {
         C: Fn(usize) -> Result<T> + Sync,
         H: FnMut(T) -> Result<()>,
     {
+        // Two outstanding partitions per rank. Finish and drain each window
+        // before submitting another, including when callbacks fail.
+        let window = self.n.saturating_mul(2).max(1);
+        if n == 0 {
+            return self.dispatch_window(0, compute, on_ok);
+        }
+        for start in (0..n).step_by(window) {
+            self.dispatch_window((n - start).min(window), |p| compute(start + p), &mut on_ok)?;
+        }
+        Ok(())
+    }
+
+    fn dispatch_window<T, C, H>(&self, n: usize, compute: C, mut on_ok: H) -> Result<()>
+    where
+        T: Serialize + DeserializeOwned,
+        C: Fn(usize) -> Result<T> + Sync,
+        H: FnMut(T) -> Result<()>,
+    {
         let mut streams = self.streams.lock().expect("cluster streams");
         if self.rank != 0 {
-            let (task_tx, task_rx) = std::sync::mpsc::channel::<Task>();
-            let (reply_tx, reply_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+            let (task_tx, task_rx) = std::sync::mpsc::sync_channel::<Task>(2);
+            let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(2);
             let stream = streams[0]
                 .try_clone()
                 .map_err(|e| Error::Cluster(format!("stream clone: {e}")))?;
@@ -350,7 +368,7 @@ impl Cluster {
                         }
                     }
                 });
-                let n_computer = spatter_core::default_parallelism().max(1);
+                let n_computer = spatter_core::default_parallelism().clamp(1, 2);
                 let mut writer_stream = streams[0]
                     .try_clone()
                     .map_err(|e| Error::Cluster(format!("stream clone: {e}")))
@@ -375,19 +393,23 @@ impl Cluster {
                         };
                         let reply = match task {
                             Task::Done => break,
-                            Task::Run { partition } => match compute(partition as usize) {
-                                Ok(v) => match encode(&v) {
-                                    Ok(payload) => Reply::Ok { partition, payload },
+                            Task::Run { partition } => {
+                                match crate::exec::catch_compute_result(partition as usize, || {
+                                    compute(partition as usize)
+                                }) {
+                                    Ok(v) => match encode(&v) {
+                                        Ok(payload) => Reply::Ok { partition, payload },
+                                        Err(e) => Reply::Err {
+                                            partition,
+                                            message: e.to_string(),
+                                        },
+                                    },
                                     Err(e) => Reply::Err {
                                         partition,
                                         message: e.to_string(),
                                     },
-                                },
-                                Err(e) => Reply::Err {
-                                    partition,
-                                    message: e.to_string(),
-                                },
-                            },
+                                }
+                            }
                         };
                         if reply_tx
                             .send(encode(&reply).expect("reply encode"))
@@ -434,7 +456,7 @@ impl Cluster {
             }
         }
         let expected: Vec<usize> = sent;
-        let (tx, rx) = std::sync::mpsc::channel::<(usize, Result<Vec<u8>>)>();
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Result<Vec<u8>>)>(2);
         let mut reader_streams = Vec::with_capacity(streams.len());
         for s in streams.iter_mut() {
             reader_streams.push(s.try_clone().map_err(io_err)?);
@@ -460,45 +482,50 @@ impl Cluster {
             }
             drop(tx);
             while let Ok((w, bytes)) = rx.recv() {
-                match bytes {
-                    Ok(bytes) => {
-                        let reply: Reply = match decode(&bytes) {
-                            Ok(r) => r,
-                            Err(_) => continue,
-                        };
-                        let p = reply.partition() as usize;
-                        match reply {
-                            Reply::Ok { payload, .. } => {
-                                let got = decode::<T>(&payload)
-                                    .map_err(|e| Error::Cluster(format!("reply decode: {e}")));
-                                match got.and_then(&mut on_ok) {
-                                    Ok(()) => {}
-                                    Err(e) => {
-                                        if first_err.is_none() {
-                                            first_err = Some(e)
-                                        }
+                if let Ok(bytes) = bytes {
+                    let reply: Reply = match decode(&bytes) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            first_err.get_or_insert(e);
+                            continue;
+                        }
+                    };
+                    let p = reply.partition() as usize;
+                    if !pending.contains(&(p, w)) {
+                        first_err.get_or_insert_with(|| {
+                            Error::Cluster(format!("unexpected partition {p} from rank {}", w + 1))
+                        });
+                        continue;
+                    }
+                    match reply {
+                        Reply::Ok { payload, .. } => {
+                            let got = decode::<T>(&payload)
+                                .map_err(|e| Error::Cluster(format!("reply decode: {e}")));
+                            match got.and_then(&mut on_ok) {
+                                Ok(()) => {}
+                                Err(e) => {
+                                    if first_err.is_none() {
+                                        first_err = Some(e)
                                     }
                                 }
-                                pending.retain(|(q, _)| *q != p);
                             }
-                            Reply::Err { .. } => {
-                                // worker compute failed: replay this partition locally
-                                pending.retain(|(q, _)| *q != p);
-                                match compute(p).and_then(&mut on_ok) {
-                                    Ok(()) => {}
-                                    Err(e) => {
-                                        if first_err.is_none() {
-                                            first_err = Some(e)
-                                        }
+                            pending.retain(|(q, _)| *q != p);
+                        }
+                        Reply::Err { .. } => {
+                            // worker compute failed: replay this partition locally
+                            pending.retain(|(q, _)| *q != p);
+                            match compute(p).and_then(&mut on_ok) {
+                                Ok(()) => {}
+                                Err(e) => {
+                                    if first_err.is_none() {
+                                        first_err = Some(e)
                                     }
                                 }
                             }
                         }
                     }
-                    Err(_) => {
-                        pending.retain(|(_, s)| *s != w);
-                    }
                 }
+                // On disconnect, retain outstanding partitions for replay.
             }
         });
         for (p, _) in pending.clone() {
@@ -632,6 +659,126 @@ pub fn join_if_configured(mut children: Vec<Child>) -> Result<Option<std::sync::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn connected_pair() -> (Cluster, Cluster) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let make = |rank, stream: TcpStream| {
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            Cluster {
+                rank,
+                n: 2,
+                streams: Mutex::new(vec![stream]),
+                children: Mutex::new(Vec::new()),
+                bytes_sent: AtomicU64::new(0),
+                bytes_recv: AtomicU64::new(0),
+            }
+        };
+        (make(0, server), make(1, client))
+    }
+
+    #[test]
+    fn disconnect_replays_outstanding_partitions() {
+        let (driver, worker) = connected_pair();
+        let peer = thread::spawn(move || {
+            let mut streams = worker.streams.lock().unwrap();
+            for _ in 0..2 {
+                let _: Task =
+                    decode(&read_frame(&mut streams[0], &worker.bytes_recv).unwrap()).unwrap();
+            }
+            streams[0].shutdown(std::net::Shutdown::Both).unwrap();
+        });
+        let start = Instant::now();
+        let mut values = Vec::new();
+        driver
+            .dispatch_each(
+                4,
+                |p| Ok(p as u64),
+                |v| {
+                    values.push(v);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        peer.join().unwrap();
+        values.sort();
+        assert_eq!(values, vec![0, 1, 2, 3]);
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn duplicate_and_wrong_owner_replies_are_rejected() {
+        for partitions in [[1, 1], [0, 3], [99, 3]] {
+            let (driver, worker) = connected_pair();
+            let peer = thread::spawn(move || {
+                let mut streams = worker.streams.lock().unwrap();
+                for p in partitions {
+                    let _: Task =
+                        decode(&read_frame(&mut streams[0], &worker.bytes_recv).unwrap()).unwrap();
+                    let reply = Reply::Ok {
+                        partition: p,
+                        payload: encode(&(p as u64)).unwrap(),
+                    };
+                    write_frame(
+                        &mut streams[0],
+                        &encode(&reply).unwrap(),
+                        &worker.bytes_sent,
+                    )
+                    .unwrap();
+                }
+            });
+            let mut values = Vec::new();
+            assert!(driver
+                .dispatch_each(
+                    4,
+                    |p| Ok(p as u64),
+                    |v| {
+                        values.push(v);
+                        Ok(())
+                    }
+                )
+                .is_err());
+            peer.join().unwrap();
+            values.sort();
+            assert_eq!(values, vec![0, 1, 2, 3]);
+        }
+    }
+
+    #[test]
+    fn bounded_windows_preserve_repeated_action_alignment() {
+        let (driver, worker) = connected_pair();
+        let peer = thread::spawn(move || {
+            for _ in 0..3 {
+                worker
+                    .dispatch_each(19, |p| Ok(p as u64), |_| Ok(()))
+                    .unwrap();
+                worker.gather(vec![99u64]).unwrap();
+            }
+        });
+        for _ in 0..3 {
+            let mut values = Vec::new();
+            driver
+                .dispatch_each(
+                    19,
+                    |p| Ok(p as u64),
+                    |v| {
+                        values.push(v);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            values.sort();
+            assert_eq!(values, (0..19).collect::<Vec<u64>>());
+            assert_eq!(driver.gather(vec![98u64]).unwrap(), vec![98, 99]);
+        }
+        peer.join().unwrap();
+    }
 
     #[test]
     fn accept_timeout_without_workers() {
