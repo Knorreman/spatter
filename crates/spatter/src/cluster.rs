@@ -158,6 +158,14 @@ enum Reply {
     Err { partition: u32, message: String },
 }
 
+impl Reply {
+    fn partition(&self) -> u32 {
+        match self {
+            Reply::Ok { partition, .. } | Reply::Err { partition, .. } => *partition,
+        }
+    }
+}
+
 impl Cluster {
     pub fn owns(&self, partition: usize) -> bool {
         partition % self.n == self.rank
@@ -314,63 +322,193 @@ impl Cluster {
     pub fn dispatch_each<T, C, H>(&self, n: usize, compute: C, mut on_ok: H) -> Result<()>
     where
         T: Serialize + DeserializeOwned,
-        C: Fn(usize) -> Result<T>,
+        C: Fn(usize) -> Result<T> + Sync,
         H: FnMut(T) -> Result<()>,
     {
         let mut streams = self.streams.lock().expect("cluster streams");
         if self.rank != 0 {
-            loop {
-                let task: Task = decode(&read_frame(&mut streams[0], &self.bytes_recv)?)?;
-                match task {
-                    Task::Done => break,
-                    Task::Run { partition } => {
-                        let reply = match compute(partition as usize) {
-                            Ok(v) => Reply::Ok {
-                                partition,
-                                payload: encode(&v)?,
-                            },
-                            Err(e) => Reply::Err {
-                                partition,
-                                message: e.to_string(),
+            let (task_tx, task_rx) = std::sync::mpsc::channel::<Task>();
+            let (reply_tx, reply_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+            let stream = streams[0]
+                .try_clone()
+                .map_err(|e| Error::Cluster(format!("stream clone: {e}")))?;
+            let task_rx = std::sync::Arc::new(std::sync::Mutex::new(task_rx));
+            let task_tx_reader = task_tx.clone();
+            drop(task_tx);
+            thread::scope(|scope| {
+                let compute = &compute;
+                let mut reader_stream = stream;
+                scope.spawn(move || {
+                    while let Ok(bytes) = read_frame(&mut reader_stream, &self.bytes_recv) {
+                        match decode::<Task>(&bytes) {
+                            Ok(Task::Done) | Err(_) => break,
+                            Ok(task) => {
+                                if task_tx_reader.send(task).is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+                let n_computer = spatter_core::default_parallelism().max(1);
+                let mut writer_stream = streams[0]
+                    .try_clone()
+                    .map_err(|e| Error::Cluster(format!("stream clone: {e}")))
+                    .expect("stream clone");
+                let writer = scope.spawn(move || {
+                    while let Ok(bytes) = reply_rx.recv() {
+                        if write_frame(&mut writer_stream, &bytes, &self.bytes_sent).is_err() {
+                            break;
+                        }
+                    }
+                });
+                for _ in 0..n_computer {
+                    let task_rx = std::sync::Arc::clone(&task_rx);
+                    let reply_tx = reply_tx.clone();
+                    scope.spawn(move || loop {
+                        let task = {
+                            let guard = task_rx.lock().expect("task rx");
+                            match guard.recv() {
+                                Ok(t) => t,
+                                Err(_) => break,
+                            }
+                        };
+                        let reply = match task {
+                            Task::Done => break,
+                            Task::Run { partition } => match compute(partition as usize) {
+                                Ok(v) => match encode(&v) {
+                                    Ok(payload) => Reply::Ok { partition, payload },
+                                    Err(e) => Reply::Err {
+                                        partition,
+                                        message: e.to_string(),
+                                    },
+                                },
+                                Err(e) => Reply::Err {
+                                    partition,
+                                    message: e.to_string(),
+                                },
                             },
                         };
-                        write_frame(&mut streams[0], &encode(&reply)?, &self.bytes_sent)?;
-                    }
+                        if reply_tx
+                            .send(encode(&reply).expect("reply encode"))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    });
                 }
-            }
+                drop(reply_tx);
+                let _ = writer.join();
+            });
             return Ok(());
         }
         let mut first_err: Option<Error> = None;
+        let mut pending: Vec<(usize, usize)> = Vec::new();
+        let mut sent: Vec<usize> = vec![0; streams.len()];
         for p in 0..n {
             if first_err.is_some() {
                 break;
             }
-            let dest = p % self.n;
-            let got = if self.owns(p) {
-                compute(p)
+            if self.owns(p) {
+                match compute(p).and_then(&mut on_ok) {
+                    Ok(()) => {}
+                    Err(e) => first_err = Some(e),
+                }
             } else {
-                let s = &mut streams[dest - 1];
-                let remote = write_frame(
+                let w = p % self.n - 1;
+                let s = &mut streams[w];
+                if write_frame(
                     s,
                     &encode(&Task::Run {
                         partition: p as u32,
                     })?,
                     &self.bytes_sent,
                 )
-                .and_then(|_| read_frame(s, &self.bytes_recv))
-                .and_then(|b| decode::<Reply>(&b))
-                .and_then(|r| match r {
-                    Reply::Ok { payload, .. } => decode(&payload),
-                    Reply::Err { message, .. } => Err(Error::Cluster(message)),
-                });
-                match remote {
-                    Ok(v) => Ok(v),
-                    Err(_) => compute(p),
+                .is_ok()
+                {
+                    pending.push((p, w));
+                    sent[w] += 1;
+                } else if first_err.is_none() {
+                    first_err = Some(Error::Cluster("task write failed".into()));
                 }
-            };
-            match got.and_then(&mut on_ok) {
+            }
+        }
+        let expected: Vec<usize> = sent;
+        let (tx, rx) = std::sync::mpsc::channel::<(usize, Result<Vec<u8>>)>();
+        let mut reader_streams = Vec::with_capacity(streams.len());
+        for s in streams.iter_mut() {
+            reader_streams.push(s.try_clone().map_err(io_err)?);
+        }
+        thread::scope(|scope| {
+            for (w, s) in reader_streams.into_iter().enumerate() {
+                let n_expected = expected[w];
+                if n_expected == 0 {
+                    continue;
+                }
+                let tx = tx.clone();
+                let recv = &self.bytes_recv;
+                scope.spawn(move || {
+                    let mut s = s;
+                    for _ in 0..n_expected {
+                        let got = read_frame(&mut s, recv);
+                        let failed = got.is_err();
+                        if tx.send((w, got)).is_err() || failed {
+                            return;
+                        }
+                    }
+                });
+            }
+            drop(tx);
+            while let Ok((w, bytes)) = rx.recv() {
+                match bytes {
+                    Ok(bytes) => {
+                        let reply: Reply = match decode(&bytes) {
+                            Ok(r) => r,
+                            Err(_) => continue,
+                        };
+                        let p = reply.partition() as usize;
+                        match reply {
+                            Reply::Ok { payload, .. } => {
+                                let got = decode::<T>(&payload)
+                                    .map_err(|e| Error::Cluster(format!("reply decode: {e}")));
+                                match got.and_then(&mut on_ok) {
+                                    Ok(()) => {}
+                                    Err(e) => {
+                                        if first_err.is_none() {
+                                            first_err = Some(e)
+                                        }
+                                    }
+                                }
+                                pending.retain(|(q, _)| *q != p);
+                            }
+                            Reply::Err { .. } => {
+                                // worker compute failed: replay this partition locally
+                                pending.retain(|(q, _)| *q != p);
+                                match compute(p).and_then(&mut on_ok) {
+                                    Ok(()) => {}
+                                    Err(e) => {
+                                        if first_err.is_none() {
+                                            first_err = Some(e)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        pending.retain(|(_, s)| *s != w);
+                    }
+                }
+            }
+        });
+        for (p, _) in pending.clone() {
+            match compute(p).and_then(&mut on_ok) {
                 Ok(()) => {}
-                Err(e) => first_err = Some(e),
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(e)
+                    }
+                }
             }
         }
         for s in streams.iter_mut() {
