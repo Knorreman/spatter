@@ -13,13 +13,13 @@ impl Span {
 impl Drop for Span {
     fn drop(&mut self) {
         if let Some((stage, start)) = self.0 {
-            eprintln!(
+            crate::metrics::log_line(format!(
                 "PROFILE pid={} rank={} stage={} us={}",
                 std::process::id(),
                 std::env::var("SPATTER_RANK").unwrap_or_else(|_| "0".into()),
                 stage,
                 start.elapsed().as_micros()
-            );
+            ));
         }
     }
 }

@@ -98,6 +98,10 @@ where
         }
     }
     flush(&mut combined, &mut buckets, &mut bytes);
+    crate::metrics::SHUFFLE_RECORDS.fetch_add(
+        buckets.iter().map(|b| b.len() as u64).sum(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     Ok(buckets)
 }
 
@@ -306,7 +310,10 @@ fn append_chunk<T: Serialize>(file: &mut File, chunk: &[T]) -> Result<()> {
     }
     file.write_all(&(bytes.len() as u32).to_be_bytes())
         .map_err(|e| Error::Io(e.to_string()))?;
-    file.write_all(&bytes).map_err(|e| Error::Io(e.to_string()))
+    file.write_all(&bytes)
+        .map_err(|e| Error::Io(e.to_string()))?;
+    crate::metrics::SPILLED.fetch_add(4 + bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
 }
 
 pub fn reduce_spilled_path<K, V, F>(path: &PathBuf, f: &F) -> Result<Vec<(K, V)>>
@@ -336,6 +343,7 @@ where
             .map_err(|e| Error::Io(e.to_string()))?;
         let chunk: Vec<(K, V)> =
             bincode::deserialize(&buf).map_err(|e| Error::Io(e.to_string()))?;
+        crate::metrics::SPILL_READ.fetch_add(4 + len as u64, std::sync::atomic::Ordering::Relaxed);
         for (k, v) in chunk {
             combine(&mut map, k, v, f);
         }
@@ -363,6 +371,7 @@ pub fn read_chunks<T: DeserializeOwned>(path: &PathBuf) -> Result<Vec<T>> {
         file.read_exact(&mut buf)
             .map_err(|e| Error::Io(e.to_string()))?;
         let chunk: Vec<T> = bincode::deserialize(&buf).map_err(|e| Error::Io(e.to_string()))?;
+        crate::metrics::SPILL_READ.fetch_add(4 + len as u64, std::sync::atomic::Ordering::Relaxed);
         out.extend(chunk);
     }
     Ok(out)

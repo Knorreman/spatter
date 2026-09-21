@@ -118,6 +118,7 @@ fn write_frame(stream: &mut TcpStream, bytes: &[u8], sent: &AtomicU64) -> Result
     stream.write_all(bytes).map_err(io_err)?;
     stream.flush().map_err(io_err)?;
     sent.fetch_add(4 + bytes.len() as u64, Ordering::Relaxed);
+    crate::metrics::SENT.fetch_add(4 + bytes.len() as u64, Ordering::Relaxed);
     Ok(())
 }
 
@@ -132,6 +133,7 @@ fn read_frame(stream: &mut TcpStream, recv: &AtomicU64) -> Result<Vec<u8>> {
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).map_err(io_err)?;
     recv.fetch_add(4 + len as u64, Ordering::Relaxed);
+    crate::metrics::RECEIVED.fetch_add(4 + len as u64, Ordering::Relaxed);
     Ok(buf)
 }
 
@@ -152,7 +154,7 @@ struct Hello {
 
 #[derive(Serialize, Deserialize)]
 enum Task {
-    Run { partition: u32 },
+    Run { partition: u32, job: u64, task: u64 },
     Done,
 }
 
@@ -332,16 +334,30 @@ impl Cluster {
         // Two outstanding partitions per rank. Finish and drain each window
         // before submitting another, including when callbacks fail.
         let window = self.n.saturating_mul(2).max(1);
+        let job = crate::metrics::job_id();
         if n == 0 {
-            return self.dispatch_window(0, compute, on_ok);
+            return self.dispatch_window(job, 0, 0, compute, on_ok);
         }
         for start in (0..n).step_by(window) {
-            self.dispatch_window((n - start).min(window), |p| compute(start + p), &mut on_ok)?;
+            self.dispatch_window(
+                job,
+                start,
+                (n - start).min(window),
+                |p| compute(start + p),
+                &mut on_ok,
+            )?;
         }
         Ok(())
     }
 
-    fn dispatch_window<T, C, H>(&self, n: usize, compute: C, mut on_ok: H) -> Result<()>
+    fn dispatch_window<T, C, H>(
+        &self,
+        job: u64,
+        offset: usize,
+        n: usize,
+        compute: C,
+        mut on_ok: H,
+    ) -> Result<()>
     where
         T: Serialize + DeserializeOwned,
         C: Fn(usize) -> Result<T> + Sync,
@@ -397,8 +413,12 @@ impl Cluster {
                         };
                         let reply = match task {
                             Task::Done => break,
-                            Task::Run { partition } => {
-                                match crate::exec::catch_compute_result(partition as usize, || {
+                            Task::Run {
+                                partition,
+                                job,
+                                task,
+                            } => {
+                                match crate::metrics::task(job, task as usize, 0, || {
                                     compute(partition as usize)
                                 }) {
                                     Ok(v) => match encode(&v) {
@@ -436,7 +456,7 @@ impl Cluster {
                 break;
             }
             if self.owns(p) {
-                match compute(p).and_then(&mut on_ok) {
+                match crate::metrics::task(job, offset + p, 0, || compute(p)).and_then(&mut on_ok) {
                     Ok(()) => {}
                     Err(e) => first_err = Some(e),
                 }
@@ -447,6 +467,8 @@ impl Cluster {
                     s,
                     &encode(&Task::Run {
                         partition: p as u32,
+                        job,
+                        task: (offset + p) as u64,
                     })?,
                     &self.bytes_sent,
                 )
@@ -518,7 +540,9 @@ impl Cluster {
                         Reply::Err { .. } => {
                             // worker compute failed: replay this partition locally
                             pending.retain(|(q, _)| *q != p);
-                            match compute(p).and_then(&mut on_ok) {
+                            match crate::metrics::task(job, offset + p, 1, || compute(p))
+                                .and_then(&mut on_ok)
+                            {
                                 Ok(()) => {}
                                 Err(e) => {
                                     if first_err.is_none() {
@@ -528,12 +552,14 @@ impl Cluster {
                             }
                         }
                     }
+                } else {
+                    crate::metrics::DISCONNECTS.fetch_add(1, Ordering::Relaxed);
                 }
                 // On disconnect, retain outstanding partitions for replay.
             }
         });
         for (p, _) in pending.clone() {
-            match compute(p).and_then(&mut on_ok) {
+            match crate::metrics::task(job, offset + p, 1, || compute(p)).and_then(&mut on_ok) {
                 Ok(()) => {}
                 Err(e) => {
                     if first_err.is_none() {

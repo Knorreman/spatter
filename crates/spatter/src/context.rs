@@ -15,6 +15,7 @@ pub struct SpatterContext {
 }
 
 pub(crate) struct ContextInner {
+    _metrics: Option<crate::metrics::MetricsServer>,
     pub parallelism: usize,
     pub cluster: Option<std::sync::Arc<crate::cluster::Cluster>>,
     next_id: AtomicU64,
@@ -143,8 +144,32 @@ impl ContextBuilder {
         let children = crate::cluster::maybe_spawn_cluster()?;
         let cluster = crate::cluster::join_if_configured(children)?;
         let parallelism = parse_local_threads(&self.master)?;
+        let metrics = match std::env::var("SPATTER_METRICS_ADDR") {
+            Ok(value) => {
+                let mut addr: std::net::SocketAddr = value
+                    .parse()
+                    .map_err(|e| spatter_core::Error::Io(format!("metrics address: {e}")))?;
+                let rank = cluster.as_ref().map(|c| c.rank).unwrap_or(0);
+                if addr.port() != 0 {
+                    let port = usize::from(addr.port())
+                        .checked_add(rank)
+                        .and_then(|p| u16::try_from(p).ok())
+                        .ok_or_else(|| spatter_core::Error::Io("metrics port overflow".into()))?;
+                    addr.set_port(port);
+                }
+                let server = crate::metrics::MetricsServer::bind(addr)
+                    .map_err(|e| spatter_core::Error::Io(e.to_string()))?;
+                crate::metrics::log_line(format!(
+                    "METRICS_LISTEN rank={rank} address={}",
+                    server.local_addr()
+                ));
+                Some(server)
+            }
+            Err(_) => None,
+        };
         Ok(SpatterContext {
             inner: Arc::new(ContextInner {
+                _metrics: metrics,
                 parallelism,
                 cluster,
                 next_id: AtomicU64::new(0),

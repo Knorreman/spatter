@@ -82,7 +82,7 @@ Reducers used for parallel aggregation should be associative and commutative.
   binaries on a trusted network; the default driver bind is `0.0.0.0`.
 
 See [execution/configuration](docs/execution.md),
-[deployment](deploy/README.md), and [release checklist](docs/releasing.md).
+[deployment](deploy/README.md), [observability](docs/observability.md), and [release checklist](docs/releasing.md).
 Repository-relative documentation is also available on GitHub.
 
 ## Development
