@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "Spatter: Spark-style RDDs as a Rust library (Design 1, same-binary)"
 rust-version.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["rdd", "parallel", "distributed", "data-processing"]
+categories = ["concurrency"]
 
 [dependencies]
 spatter-core.workspace = true
