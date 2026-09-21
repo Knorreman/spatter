@@ -128,6 +128,7 @@ where
         return Ok(Vec::new());
     }
     let threads = parallelism.max(1).min(n_partitions);
+    let job = crate::metrics::job_id();
     let (tx, rx) = mpsc::channel();
     thread::scope(|scope| {
         for t in 0..threads {
@@ -143,7 +144,17 @@ where
                         }
                         let mut attempts = 0u32;
                         let msg = loop {
+                            crate::metrics::start_task("local", job, p, attempts);
+                            let started = std::time::Instant::now();
                             let part = catch_unwind(AssertUnwindSafe(|| compute(p, action)));
+                            crate::metrics::observe_task(
+                                "local",
+                                job,
+                                p,
+                                attempts,
+                                started.elapsed(),
+                                matches!(&part, Ok(Ok(_))),
+                            );
                             match part {
                                 Ok(Ok(v)) => break Ok((p, v)),
                                 Ok(Err(e)) => break Err(e),

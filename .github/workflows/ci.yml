@@ -59,7 +59,7 @@ jobs:
       - run: cargo test --workspace --all-targets --locked
       - run: cargo test --doc --workspace --locked
       - name: Forced-spill shuffle and lineage checks
-        run: SPATTER_SPILL_MB=0 cargo test --locked --test shuffle --test dag
+        run: SPATTER_SPILL_MB=0 cargo test --locked --test shuffle --test dag --test metrics
       - name: Cluster smoke test
         run: |
           printf 'hello world hello\nfoo bar foo\n' > input.txt

@@ -26,6 +26,7 @@ mod context;
 mod dag;
 mod exec;
 mod lineage;
+pub mod metrics;
 mod partitioner;
 mod profile;
 mod rdd;

@@ -3,6 +3,7 @@
 Run after cargo build --release --example wordcount (Linux).
 """
 import os
+import json
 from pathlib import Path
 import signal
 import socket
@@ -16,7 +17,8 @@ def run(path, kill_worker=False):
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
     env = {k: v for k, v in os.environ.items() if not k.startswith("SPATTER_")}
-    env.update(SPATTER_PORT=str(port), SPATTER_CLUSTER_TIMEOUT_MS="2000")
+    env.update(SPATTER_PORT=str(port), SPATTER_CLUSTER_TIMEOUT_MS="2000",
+               SPATTER_TASK_LOG="1", SPATTER_METRICS_ADDR="127.0.0.1:0")
     proc = subprocess.Popen(
         ["target/release/examples/wordcount", "--cluster", "3", str(path)],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -43,6 +45,12 @@ def run(path, kill_worker=False):
             else:
                 raise AssertionError("did not observe active worker input")
         _, stderr = proc.communicate(timeout=20)
+        events = [json.loads(line) for line in stderr.splitlines() if line.startswith('{"event":')]
+        assert events, stderr
+        assert all({"job", "partition", "attempt", "rank", "scope"} <= event.keys() for event in events)
+        finished = [e for e in events if e["event"] == "task_finished"]
+        assert finished and all({"duration_us", "success"} <= event.keys() for event in finished)
+        assert "METRICS_LISTEN" in stderr, stderr
         if proc.returncode == 0:
             assert "keys=2 sum=6000000 " in stderr, stderr
         else:

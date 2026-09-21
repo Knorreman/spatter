@@ -38,6 +38,11 @@ partition panic retries and cluster replay do not provide exactly-once effects.
 | `SPATTER_SPILL_MB` | Spill threshold, `64`; zero forces spill paths, not zero heap use |
 | `SPATTER_REDUCE_THREADS` | Spilled-bucket reduction threads, `2`, capped by context parallelism |
 | `SPATTER_PROFILE` | Set to enable stderr profiling spans |
+| `SPATTER_TASK_LOG` | Set to emit structured task start/finish events |
+| `SPATTER_METRICS_ADDR` | Opt-in HTTP metrics bind address; rank is added to a nonzero base port |
+
+See [observability](observability.md) for endpoint lifetime, counter definitions
+and event correlation semantics.
 
 Local `--cluster N` spawning explicitly uses a localhost master address. For
 manual multi-host launch, set N/RANK/MASTER on each process instead of using
